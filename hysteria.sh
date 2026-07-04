@@ -2,6 +2,12 @@
 
 export LANG=en_US.UTF-8
 
+# 利用 SCRIPT_WRAPPER 将核心内容释放到本地，实现双模运行
+cat << 'SCRIPT_WRAPPER' > /root/hysteria.sh
+#!/bin/bash
+
+export LANG=en_US.UTF-8
+
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -426,5 +432,9 @@ menu() {
     esac
 }
 
-# 脚本最后直接执行主菜单函数
 menu
+SCRIPT_WRAPPER
+
+# 自动赋予本地释放出的脚本执行权限，并立刻执行本地脚本
+chmod +x /root/hysteria.sh
+/root/hysteria.sh
