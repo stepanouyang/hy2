@@ -1,8 +1,3 @@
-#!/bin/bash
-
-export LANG=en_US.UTF-8
-
-# 利用 SCRIPT_WRAPPER 将核心内容释放到本地，实现双模运行
 cat << 'SCRIPT_WRAPPER' > /root/hysteria.sh
 #!/bin/bash
 
@@ -44,7 +39,7 @@ realip(){
 }
 
 install_official_core(){
-    green "正在从 Hysteria 2 官方仓库 (apernet/hysteria) 获取最新版本..."
+    green "正在从 Hysteria 2 官方通道获取最新内核..."
     ARCH=$(uname -m)
     case "$ARCH" in
         x86_64) HY_ARCH="amd64" ;;
@@ -52,49 +47,47 @@ install_official_core(){
         s390x) HY_ARCH="s390x" ;;
         *) red "官方未提供针对此架构 ($ARCH) 的预编译文件！" && exit 1 ;;
     esac
-    
-    LATEST_VERSION=$(curl -s --connect-timeout 10 https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [[ -z "$LATEST_VERSION" ]]; then
-        yellow "直连 API 失败，尝试通过镜像节点获取版本号..."
-        LATEST_VERSION=$(curl -s --connect-timeout 10 https://mirror.ghproxy.com/https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    fi
-    
-    if [[ -z "$LATEST_VERSION" ]]; then
-        red "获取官方版本号失败，请检查本机 network！" && exit 1
-    fi
-    green "官方最新版本为: $LATEST_VERSION"
-    
-    MIRRORS=(
-        ""
-        "https://mirror.ghproxy.com/"
-        "https://gh-proxy.com/"
-        "https://fastgh.qwq.boy/"
+
+    # 官方 Anycast CDN 与无 API 限流的多层级高可用下载链
+    DOWNLOAD_SOURCES=(
+        "https://download.hysteria.network/app/latest/hysteria-linux-${HY_ARCH}"
+        "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
+        "https://mirror.ghproxy.com/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
+        "https://gh-proxy.com/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
     )
-    
+
     SUCCESS=0
-    for mirror in "${MIRRORS[@]}"; do
-        DOWNLOAD_URL="${mirror}https://github.com/apernet/hysteria/releases/download/${LATEST_VERSION}/hysteria-linux-${HY_ARCH}"
-        
-        if [[ -z "$mirror" ]]; then
-            green "正在尝试直连下载..."
-        else
-            yellow "直连超时，切换备用加速镜像: $mirror ..."
-        fi
-        
+    for url in "${DOWNLOAD_SOURCES[@]}"; do
+        green "正在连接官方通道: $url ..."
         rm -f /usr/local/bin/hysteria
-        if curl -L --connect-timeout 10 -m 60 -o /usr/local/bin/hysteria "$DOWNLOAD_URL"; then
+        if curl -L --connect-timeout 10 -m 90 -f -o /usr/local/bin/hysteria "$url"; then
             if [[ -s "/usr/local/bin/hysteria" ]]; then
-                SUCCESS=1
-                break
+                chmod +x /usr/local/bin/hysteria
+                if /usr/local/bin/hysteria version >/dev/null 2>&1 || /usr/local/bin/hysteria --version >/dev/null 2>&1; then
+                    SUCCESS=1
+                    break
+                fi
             fi
         fi
+        yellow "当前通道超时或异常，自动切换备用高可用通道..."
     done
-    
+
+    # 兜底：如果直链受阻，调用官方 get.hy2.sh 核心安装器
+    if [[ $SUCCESS -ne 1 ]]; then
+        yellow "静态通道受阻，尝试启用官方安装脚本通道..."
+        if curl -fsSL https://get.hy2.sh/ | bash -s -- --no-service; then
+            if [[ -s "/usr/local/bin/hysteria" ]]; then
+                chmod +x /usr/local/bin/hysteria
+                SUCCESS=1
+            fi
+        fi
+    fi
+
     if [[ $SUCCESS -eq 1 ]]; then
-        chmod +x /usr/local/bin/hysteria
-        green "官方内核下载完毕！"
+        INSTALLED_VER=$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1 || /usr/local/bin/hysteria --version 2>/dev/null | head -n 1 || echo "Latest")
+        green "官方最新内核部署成功！版本: $INSTALLED_VER"
     else
-        red "所有下载源均不可达，下载失败！" && exit 1
+        red "所有官方下载源均不可达，请检查 VPS 的公网网络或 DNS！" && exit 1
     fi
 
     mkdir -p /etc/hysteria
@@ -225,6 +218,7 @@ insthysteria(){
     install_official_core
     inst_cert && inst_port && inst_pwd && inst_site
 
+    # 黄金法则：原作者验证通过的无死锁原生双栈监听
     {
         echo "listen: :$port"
         echo ""
@@ -377,10 +371,10 @@ showconf(){
     fi
     
     echo ""
-    yellow "🛠️ 请根据你本地设备的网络情况，按需选择下方节点链接导入："
+    yellow "🛠️ 请根据本地网络环境，按需选择下方节点链接导入："
     echo "--------------------------------------------------------------------------------------"
     if [ -f "/root/hy/url_v4.txt" ] && [ -n "$ipv4" ]; then
-        green "【IPv4 专属链接（100% 正常通畅，推荐直接导入此链接）：】"
+        green "【IPv4 专属链接（100% 兼容全网络环境）：】"
         cat /root/hy/url_v4.txt
         echo "--------------------------------------------------------------------------------------"
     fi
@@ -397,7 +391,7 @@ update_core(){
     install_official_core
     systemctl restart hysteria-server
     if systemctl is-active --quiet hysteria-server; then
-        green "Hysteria 2 官方最新内核已升级并重启完毕！"
+        green "Hysteria 2 官方最新内核已热更新并重启完毕！"
     else
         red "服务重启失败，请检查运行状态！"
     fi
@@ -415,7 +409,7 @@ menu() {
     echo " -------------"
     echo -e " ${GREEN}3.${PLAIN} 开启、关闭、重启控制器"
     echo -e " ${GREEN}4.${PLAIN} 快捷微调端口或密码"
-    echo -e " ${GREEN}5.${PLAIN} 显示当前的双栈客户端配置"
+    echo -e " ${GREEN}5.${PLAIN} 打印当前的双栈客户端配置"
     echo " -------------"
     echo -e " ${GREEN}6.${PLAIN} 同步更新 Hysteria 2 官方最新内核"
     echo -e " ${GREEN}0.${PLAIN} 退出"
@@ -435,6 +429,5 @@ menu() {
 menu
 SCRIPT_WRAPPER
 
-# 自动赋予本地释放出的脚本执行权限，并立刻执行本地脚本
 chmod +x /root/hysteria.sh
-/root/hysteria.sh
+bash /root/hysteria.sh
