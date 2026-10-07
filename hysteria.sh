@@ -1,4 +1,3 @@
-cat << 'SCRIPT_WRAPPER' > /root/hysteria.sh
 #!/bin/bash
 
 export LANG=en_US.UTF-8
@@ -47,14 +46,39 @@ save_firewall(){
     fi
 }
 
+init_firewall_chains(){
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -N HY2_PREROUTING 2>/dev/null || true
+        iptables -t nat -C PREROUTING -j HY2_PREROUTING 2>/dev/null || iptables -t nat -I PREROUTING 1 -j HY2_PREROUTING 2>/dev/null || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -N HY2_PREROUTING 2>/dev/null || true
+        ip6tables -t nat -C PREROUTING -j HY2_PREROUTING 2>/dev/null || ip6tables -t nat -I PREROUTING 1 -j HY2_PREROUTING 2>/dev/null || true
+    fi
+}
+
 clean_jump_rules(){
-    for cmd in iptables ip6tables; do
-        if command -v $cmd >/dev/null 2>&1; then
-            while read -r rule; do
-                [[ -n "$rule" ]] && eval "$cmd -t nat ${rule/-A/-D}" 2>/dev/null
-            done < <($cmd -t nat -S PREROUTING 2>/dev/null | grep -E "\-j DNAT \-\-to\-destination :[0-9]+")
-        fi
-    done
+    init_firewall_chains
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -F HY2_PREROUTING 2>/dev/null || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -F HY2_PREROUTING 2>/dev/null || true
+    fi
+    save_firewall
+}
+
+apply_jump_rules(){
+    local p="$1"
+    local fp="$2"
+    local ep="$3"
+    clean_jump_rules
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -A HY2_PREROUTING -p udp --dport "$fp:$ep" -j DNAT --to-destination ":$p" 2>/dev/null || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -A HY2_PREROUTING -p udp --dport "$fp:$ep" -j DNAT --to-destination ":$p" 2>/dev/null || true
+    fi
     save_firewall
 }
 
@@ -136,7 +160,7 @@ inst_cert(){
     green "=================================================="
     green " [步骤 1/5] 配置 TLS 证书"
     green "=================================================="
-    echo -e " 1. 必应自签证书 （默认）\n 2. Acme 脚本自动申请\n 3. 自定义证书路径"
+    echo -e " 1. 必应自签证书 (默认)\n 2. Acme 脚本自动申请\n 3. 自定义证书路径"
     read -rp "请输入选项 [1-3] (回车默认 1): " certInput
     [[ -z "$certInput" ]] && certInput=1
     
@@ -151,9 +175,9 @@ inst_cert(){
             hy_domain=$domain
         else
             realip
-            read -p "请输入需要申请证书的域名：" domain
+            read -p "请输入需要申请证书的域名: " domain
             [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
-            green "已输入的域名：$domain"
+            green "已输入的域名: $domain"
             
             domainIP=$(dig @8.8.8.8 +time=2 +short "$domain" 2>/dev/null)
             if echo $domainIP | grep -q "network unreachable\|timed out" || [[ -z $domainIP ]]; then
@@ -163,7 +187,7 @@ inst_cert(){
             if [[ "$domainIP" != "$ipv4" && "$domainIP" != "$ipv6" ]]; then
                 red "解析 IP ($domainIP) 与本机 IP ($ipv4 / $ipv6) 不匹配。"
                 yellow "是否强行继续匹配申请？"
-                read -p "1. 是 2. 否 [1-2]：" ipChoice
+                read -p "1. 是 2. 否 [1-2]: " ipChoice
                 if [[ $ipChoice != 1 ]]; then exit 1; fi
             fi
 
@@ -195,9 +219,9 @@ inst_cert(){
             fi
         fi
     elif [[ $certInput == 3 ]]; then
-        read -p "请输入公钥 crt 路径：" cert_path
-        read -p "请输入密钥 key 路径：" key_path
-        read -p "请输入证书域名：" domain
+        read -p "请输入公钥 crt 路径: " cert_path
+        read -p "请输入密钥 key 路径: " key_path
+        read -p "请输入证书域名: " domain
         hy_domain=$domain
     else
         green "使用必应自签证书"
@@ -222,7 +246,7 @@ inst_port(){
         read -p "请重新设置主监听端口: " port
         [[ -z "$port" ]] && port=$(shuf -i 2000-65535 -n 1)
     done
-    yellow "已确认主监听端口: $port"
+    yellow "使用主监听端口: $port"
 }
 
 inst_jump(){
@@ -230,7 +254,7 @@ inst_jump(){
     green "=================================================="
     green " [步骤 3/5] 配置端口跳跃 (Port Hopping)"
     green "=================================================="
-    echo -e " 1. 单端口模式 (默认)\n 2. 启用端口跳跃 (推荐，有效规避 UDP 限速与阻断)"
+    echo -e " 1. 单端口模式 (默认)\n 2. 启用端口跳跃 (强烈推荐：抗封锁与抗 QoS 阻断)"
     read -rp "请选择端口使用模式 [1-2] (回车默认 1): " jumpInput
     [[ -z "$jumpInput" ]] && jumpInput=1
 
@@ -257,15 +281,12 @@ inst_jump(){
             fi
         done
 
-        clean_jump_rules
-        green "正在注入双栈 UDP DNAT 转发规则: $firstport:$endport -> :$port ..."
-        iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
-        ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" 2>/dev/null || true
-        save_firewall
+        apply_jump_rules "$port" "$firstport" "$endport"
 
+        mkdir -p /etc/hysteria
         echo "firstport=$firstport" > /etc/hysteria/jump.conf
         echo "endport=$endport" >> /etc/hysteria/jump.conf
-        green "端口跳跃规则应用成功！生效范围: $firstport - $endport"
+        green "端口跳跃规则应用成功！生效范围: $firstport - $endport -> :$port"
     else
         clean_jump_rules
         rm -f /etc/hysteria/jump.conf
@@ -302,14 +323,12 @@ insthysteria(){
 
     install_official_core
 
-    # 分步调用，绝不使用 && 串联，消除静默短路
     inst_cert
     inst_port
     inst_jump
     inst_pwd
     inst_site
 
-    # 服务端主配置
     {
         echo "listen: :$port"
         echo ""
@@ -344,7 +363,6 @@ insthysteria(){
 
     mkdir -p /root/hy
 
-    # 通用客户端 YAML
     {
         echo "server: $client_ip:$last_port"
         echo "auth: $auth_pwd"
@@ -368,7 +386,6 @@ insthysteria(){
         fi
     } > /root/hy/hy-client.yaml
 
-    # Clash Meta / Mihomo 配置
     {
         echo "mixed-port: 7890"
         echo "allow-lan: false"
@@ -420,7 +437,6 @@ insthysteria(){
         echo "hysteria2://$auth_pwd@[$ipv6]:$port/?insecure=1&sni=$hy_domain#Hysteria2-IPv6-NoHop" > /root/hy/url_v6_nohop.txt
     fi
 
-    # 放行本地防火墙
     iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
     ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
     if [[ -n "$firstport" && -n "$endport" ]]; then
@@ -446,7 +462,18 @@ unsthysteria(){
     rm -f /etc/systemd/system/hysteria-server.service
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy
     systemctl daemon-reload
-    clean_jump_rules
+    
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -D PREROUTING -j HY2_PREROUTING 2>/dev/null || true
+        iptables -t nat -F HY2_PREROUTING 2>/dev/null || true
+        iptables -t nat -X HY2_PREROUTING 2>/dev/null || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -D PREROUTING -j HY2_PREROUTING 2>/dev/null || true
+        ip6tables -t nat -F HY2_PREROUTING 2>/dev/null || true
+        ip6tables -t nat -X HY2_PREROUTING 2>/dev/null || true
+    fi
+    save_firewall
     green "Hysteria 2 已彻底卸载干净！"
 }
 
@@ -471,16 +498,13 @@ changeconf(){
         sed -i "s#:$oldport#:$port#g" /etc/hysteria/config.yaml
         if [[ -f /etc/hysteria/jump.conf ]]; then
             source /etc/hysteria/jump.conf
-            clean_jump_rules
-            iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
-            ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" 2>/dev/null || true
-            save_firewall
+            apply_jump_rules "$port" "$firstport" "$endport"
         fi
         systemctl restart hysteria-server && green "主监听端口修改完毕！"
     elif [ "$confAnswer" == "2" ]; then
         port=$(cat /etc/hysteria/config.yaml | grep -E "listen:" | awk -F ":" '{print $NF}' | tr -d '"' | tr -d ' ')
         inst_jump
-        green "端口跳跃规则已更新！请重新运行选项 5 打印最新配置。"
+        green "端口跳跃规则已更新！请重新运行主菜单选项 5 打印最新配置。"
     elif [ "$confAnswer" == "3" ]; then
         read -p "请输入全新密码: " passwd
         sed -i "s/password:.*/password: \"$passwd\"/g" /etc/hysteria/config.yaml
@@ -570,7 +594,3 @@ menu() {
 }
 
 menu
-SCRIPT_WRAPPER
-
-chmod +x /root/hysteria.sh
-bash /root/hysteria.sh
