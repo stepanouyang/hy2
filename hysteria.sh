@@ -38,6 +38,27 @@ realip(){
     ipv6=$(curl -s6m5 https://api.ip.sb/ip || curl -s6m5 https://ip.gs || echo "")
 }
 
+save_firewall(){
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif command -v service >/dev/null 2>&1 && service iptables status >/dev/null 2>&1; then
+        service iptables save >/dev/null 2>&1
+        service ip6tables save >/dev/null 2>&1
+    fi
+}
+
+clean_jump_rules(){
+    # 精准剔除旧的端口转发，杜绝 iptables -F PREROUTING 破坏 Docker 容器网络
+    for cmd in iptables ip6tables; do
+        if command -v $cmd >/dev/null 2>&1; then
+            while read -r rule; do
+                [[ -n "$rule" ]] && eval "$cmd -t nat ${rule/-A/-D}" 2>/dev/null
+            done < <($cmd -t nat -S PREROUTING 2>/dev/null | grep -E "\-j DNAT \-\-to\-destination :[0-9]+")
+        fi
+    done
+    save_firewall
+}
+
 install_official_core(){
     green "正在从 Hysteria 2 官方通道获取最新内核..."
     ARCH=$(uname -m)
@@ -48,7 +69,6 @@ install_official_core(){
         *) red "官方未提供针对此架构 ($ARCH) 的预编译文件！" && exit 1 ;;
     esac
 
-    # 官方 Anycast CDN 与无 API 限流的多层级高可用下载链
     DOWNLOAD_SOURCES=(
         "https://download.hysteria.network/app/latest/hysteria-linux-${HY_ARCH}"
         "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
@@ -72,7 +92,6 @@ install_official_core(){
         yellow "当前通道超时或异常，自动切换备用高可用通道..."
     done
 
-    # 兜底：如果直链受阻，调用官方 get.hy2.sh 核心安装器
     if [[ $SUCCESS -ne 1 ]]; then
         yellow "静态通道受阻，尝试启用官方安装脚本通道..."
         if curl -fsSL https://get.hy2.sh/ | bash -s -- --no-service; then
@@ -188,13 +207,58 @@ inst_cert(){
     fi
 }
 
+inst_jump(){
+    green "Hysteria 2 端口使用模式配置："
+    echo -e " 1. 单端口模式 (默认)\n 2. 端口跳跃模式 (抗封锁与抗 QoS 推荐)"
+    read -rp "请输入选项 [1-2]: " jumpInput
+    firstport=""
+    endport=""
+
+    if [[ $jumpInput == 2 ]]; then
+        while true; do
+            read -p "设置范围端口的起始端口 (建议 10000-65535，默认 20000)：" firstport
+            [[ -z $firstport ]] && firstport=20000
+            read -p "设置范围端口的末尾端口 (建议 10000-65535，默认 40000)：" endport
+            [[ -z $endport ]] && endport=40000
+
+            if [[ ! "$firstport" =~ ^[0-9]+$ ]] || [[ ! "$endport" =~ ^[0-9]+$ ]]; then
+                red "端口必须为数字！"
+            elif [[ $firstport -le 0 || $firstport -gt 65535 || $endport -le 0 || $endport -gt 65535 ]]; then
+                red "端口范围必须在 1-65535 之间！"
+            elif [[ $firstport -ge $endport ]]; then
+                red "起始端口 ($firstport) 必须小于末尾端口 ($endport)！"
+            elif [[ $port -ge $firstport && $port -le $endport ]]; then
+                red "主监听端口 ($port) 不能包含在跳跃端口范围内，请重新调整！"
+            else
+                break
+            fi
+        done
+
+        clean_jump_rules
+        green "正在注入双栈 UDP DNAT 转发规则: $firstport:$endport -> :$port ..."
+        iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+        ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" 2>/dev/null || true
+        save_firewall
+
+        # 记录跳跃配置
+        echo "firstport=$firstport" > /etc/hysteria/jump.conf
+        echo "endport=$endport" >> /etc/hysteria/jump.conf
+        green "端口跳跃规则应用成功！"
+    else
+        clean_jump_rules
+        rm -f /etc/hysteria/jump.conf
+        yellow "已选择单端口模式"
+    fi
+}
+
 inst_port(){
-    read -p "设置 Hysteria 2 端口 [1-65535]（回车随机）：" port
+    read -p "设置 Hysteria 2 主监听端口 [1-65535]（回车随机分配）：" port
     [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
     until [[ -z $(ss -tunlp | grep -w udp | grep -E ":$port$") ]]; do
-        echo -e "${RED} $port 端口占用！${PLAIN}"; read -p "重新设置：" port
+        echo -e "${RED} $port 端口占用！${PLAIN}"; read -p "重新设置端口：" port
     done
-    yellow "使用端口：$port"
+    yellow "使用主监听端口：$port"
+    inst_jump
 }
 
 inst_pwd(){
@@ -218,7 +282,7 @@ insthysteria(){
     install_official_core
     inst_cert && inst_port && inst_pwd && inst_site
 
-    # 黄金法则：原作者验证通过的无死锁原生双栈监听
+    # 黄金法则：无死锁双栈原生监听配置
     {
         echo "listen: :$port"
         echo ""
@@ -245,9 +309,17 @@ insthysteria(){
 
     if [ -n "$ipv4" ]; then client_ip="$ipv4"; else client_ip="[$ipv6]"; fi
 
+    if [[ -n "$firstport" && -n "$endport" ]]; then
+        last_port="$port,$firstport-$endport"
+    else
+        last_port="$port"
+    fi
+
     mkdir -p /root/hy
+
+    # 生成通用客户端 YAML 配置文件
     {
-        echo "server: $client_ip:$port"
+        echo "server: $client_ip:$last_port"
         echo "auth: $auth_pwd"
         echo "tls:"
         echo "  sni: $hy_domain"
@@ -262,8 +334,14 @@ insthysteria(){
         echo "  strategy: auto"
         echo "socks5:"
         echo "  listen: 127.0.0.1:5080"
+        if [[ -n "$firstport" && -n "$endport" ]]; then
+            echo "transport:"
+            echo "  udp:"
+            echo "    hopInterval: 30s"
+        fi
     } > /root/hy/hy-client.yaml
 
+    # 生成 Clash Meta / Mihomo 配置
     {
         echo "mixed-port: 7890"
         echo "allow-lan: false"
@@ -285,11 +363,16 @@ insthysteria(){
             echo "    type: hysteria2"
             echo "    server: $ipv4"
             echo "    port: $port"
+            if [[ -n "$firstport" && -n "$endport" ]]; then
+                echo "    ports: $last_port"
+                echo "    hop-interval: 30"
+            fi
             echo "    password: $auth_pwd"
             echo "    sni: $hy_domain"
             echo "    skip-cert-verify: true"
         } >> /root/hy/clash-meta.yaml
-        echo "hysteria2://$auth_pwd@$ipv4:$port/?insecure=1&sni=$hy_domain#Hysteria2-IPv4" > /root/hy/url_v4.txt
+        echo "hysteria2://$auth_pwd@$ipv4:$last_port/?insecure=1&sni=$hy_domain#Hysteria2-IPv4" > /root/hy/url_v4.txt
+        echo "hysteria2://$auth_pwd@$ipv4:$port/?insecure=1&sni=$hy_domain#Hysteria2-IPv4-NoHop" > /root/hy/url_v4_nohop.txt
     fi
 
     if [ -n "$ipv6" ]; then
@@ -298,15 +381,26 @@ insthysteria(){
             echo "    type: hysteria2"
             echo "    server: $ipv6"
             echo "    port: $port"
+            if [[ -n "$firstport" && -n "$endport" ]]; then
+                echo "    ports: $last_port"
+                echo "    hop-interval: 30"
+            fi
             echo "    password: $auth_pwd"
             echo "    sni: $hy_domain"
             echo "    skip-cert-verify: true"
         } >> /root/hy/clash-meta.yaml
-        echo "hysteria2://$auth_pwd@[$ipv6]:$port/?insecure=1&sni=$hy_domain#Hysteria2-IPv6" > /root/hy/url_v6.txt
+        echo "hysteria2://$auth_pwd@[$ipv6]:$last_port/?insecure=1&sni=$hy_domain#Hysteria2-IPv6" > /root/hy/url_v6.txt
+        echo "hysteria2://$auth_pwd@[$ipv6]:$port/?insecure=1&sni=$hy_domain#Hysteria2-IPv6-NoHop" > /root/hy/url_v6_nohop.txt
     fi
 
-    sudo iptables -A INPUT -p udp --dport $port -j ACCEPT 2>/dev/null || true
-    sudo ip6tables -A INPUT -p udp --dport $port -j ACCEPT 2>/dev/null || true
+    # 放行本地防火墙端口
+    iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    if [[ -n "$firstport" && -n "$endport" ]]; then
+        iptables -I INPUT -p udp --dport "$firstport:$endport" -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT -p udp --dport "$firstport:$endport" -j ACCEPT 2>/dev/null || true
+    fi
+    save_firewall
 
     systemctl enable hysteria-server
     systemctl restart hysteria-server
@@ -325,9 +419,7 @@ unsthysteria(){
     rm -f /etc/systemd/system/hysteria-server.service
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy
     systemctl daemon-reload
-    iptables -t nat -F PREROUTING >/dev/null 2>&1
-    ip6tables -t nat -F PREROUTING >/dev/null 2>&1
-    netfilter-persistent save >/dev/null 2>&1
+    clean_jump_rules
     green "Hysteria 2 已彻底卸载干净！"
 }
 
@@ -344,14 +436,25 @@ hysteriaswitch(){
 
 changeconf(){
     green "修改向导："
-    echo -e " 1. 修改端口\n 2. 修改密码"
-    read -p " 请选择 [1-2]：" confAnswer
+    echo -e " 1. 修改主监听端口\n 2. 重新配置端口跳跃\n 3. 修改密码"
+    read -p " 请选择 [1-3]：" confAnswer
     if [ "$confAnswer" == "1" ]; then
         oldport=$(cat /etc/hysteria/config.yaml | grep -E "listen:" | awk -F ":" '{print $NF}' | tr -d '"' | tr -d ' ')
-        read -p "请输入全新端口: " port
+        read -p "请输入全新主监听端口: " port
         sed -i "s#:$oldport#:$port#g" /etc/hysteria/config.yaml
-        systemctl restart hysteria-server && green "端口修改完毕！"
+        if [[ -f /etc/hysteria/jump.conf ]]; then
+            source /etc/hysteria/jump.conf
+            clean_jump_rules
+            iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
+            ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" 2>/dev/null || true
+            save_firewall
+        fi
+        systemctl restart hysteria-server && green "主监听端口修改完毕！"
     elif [ "$confAnswer" == "2" ]; then
+        port=$(cat /etc/hysteria/config.yaml | grep -E "listen:" | awk -F ":" '{print $NF}' | tr -d '"' | tr -d ' ')
+        inst_jump
+        green "端口跳跃规则已更新！建议执行选项 1 重新生成客户端配置以同步更改。"
+    elif [ "$confAnswer" == "3" ]; then
         read -p "请输入全新密码: " passwd
         sed -i "s/password:.*/password: \"$passwd\"/g" /etc/hysteria/config.yaml
         systemctl restart hysteria-server && green "密码修改完毕！"
@@ -362,10 +465,19 @@ showconf(){
     realip
     echo "======================================================================================"
     green "Hysteria 2 原生双栈环境完全体配置生成成功"
+    if [ -f "/etc/hysteria/jump.conf" ]; then
+        source /etc/hysteria/jump.conf
+        yellow "当前运行模式: 端口跳跃模式 (范围: $firstport - $endport)"
+    else
+        yellow "当前运行模式: 单端口模式"
+    fi
+    echo "======================================================================================"
+
     if [ -f "/root/hy/hy-client.yaml" ]; then
         yellow "通用 YAML 客户端文件 (/root/hy/hy-client.yaml):"
         cat /root/hy/hy-client.yaml
     fi
+    echo "--------------------------------------------------------------------------------------"
     if [ -f "/root/hy/clash-meta.yaml" ]; then
         yellow "Clash Meta 配置文件已生成至: /root/hy/clash-meta.yaml"
     fi
@@ -374,13 +486,17 @@ showconf(){
     yellow "🛠️ 请根据本地网络环境，按需选择下方节点链接导入："
     echo "--------------------------------------------------------------------------------------"
     if [ -f "/root/hy/url_v4.txt" ] && [ -n "$ipv4" ]; then
-        green "【IPv4 专属链接（100% 兼容全网络环境）：】"
+        green "【IPv4 跳跃节点链接】:"
         cat /root/hy/url_v4.txt
+        yellow "【IPv4 备用单端口链接】:"
+        cat /root/hy/url_v4_nohop.txt
         echo "--------------------------------------------------------------------------------------"
     fi
     if [ -f "/root/hy/url_v6.txt" ] && [ -n "$ipv6" ]; then
-        green "【IPv6 专属链接（适合本地支持 IPv6 的网络环境）：】"
+        green "【IPv6 跳跃节点链接】:"
         cat /root/hy/url_v6.txt
+        yellow "【IPv6 备用单端口链接】:"
+        cat /root/hy/url_v6_nohop.txt
         echo "--------------------------------------------------------------------------------------"
     fi
     echo "======================================================================================"
@@ -404,11 +520,11 @@ menu() {
     echo -e "#           ${YELLOW}数据源: apernet/hysteria 官方直连${PLAIN}               #"
     echo "#############################################################"
     echo ""
-    echo -e " ${GREEN}1.${PLAIN} 安装/覆盖 Hysteria 2 (原生双栈支持)"
+    echo -e " ${GREEN}1.${PLAIN} 安装/覆盖 Hysteria 2 (原生双栈 + 端口跳跃)"
     echo -e " ${GREEN}2.${PLAIN} ${RED}物理卸载 Hysteria 2${PLAIN}"
     echo " -------------"
     echo -e " ${GREEN}3.${PLAIN} 开启、关闭、重启控制器"
-    echo -e " ${GREEN}4.${PLAIN} 快捷微调端口或密码"
+    echo -e " ${GREEN}4.${PLAIN} 快捷微调端口、跳跃规则或密码"
     echo -e " ${GREEN}5.${PLAIN} 打印当前的双栈客户端配置"
     echo " -------------"
     echo -e " ${GREEN}6.${PLAIN} 同步更新 Hysteria 2 官方最新内核"
