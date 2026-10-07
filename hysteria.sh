@@ -48,7 +48,6 @@ save_firewall(){
 }
 
 clean_jump_rules(){
-    # 精准剔除旧的端口转发，杜绝 iptables -F PREROUTING 破坏 Docker 容器网络
     for cmd in iptables ip6tables; do
         if command -v $cmd >/dev/null 2>&1; then
             while read -r rule; do
@@ -133,9 +132,13 @@ install_official_core(){
 }
 
 inst_cert(){
-    green "Hysteria 2 协议证书申请方式如下："
+    echo ""
+    green "=================================================="
+    green " [步骤 1/5] 配置 TLS 证书"
+    green "=================================================="
     echo -e " 1. 必应自签证书 （默认）\n 2. Acme 脚本自动申请\n 3. 自定义证书路径"
-    read -rp "请输入选项 [1-3]: " certInput
+    read -rp "请输入选项 [1-3] (回车默认 1): " certInput
+    [[ -z "$certInput" ]] && certInput=1
     
     if [[ $certInput == 2 ]]; then
         cert_path="/root/cert.crt"
@@ -207,28 +210,48 @@ inst_cert(){
     fi
 }
 
+inst_port(){
+    echo ""
+    green "=================================================="
+    green " [步骤 2/5] 配置 Hysteria 2 主监听端口"
+    green "=================================================="
+    read -p "设置 Hysteria 2 主监听端口 [1-65535] (回车随机分配): " port
+    [[ -z "$port" ]] && port=$(shuf -i 2000-65535 -n 1)
+    until [[ -z $(ss -tunlp | awk '{print $5}' | grep -E ":$port$") ]]; do
+        red "端口 $port 已被占用！"
+        read -p "请重新设置主监听端口: " port
+        [[ -z "$port" ]] && port=$(shuf -i 2000-65535 -n 1)
+    done
+    yellow "已确认主监听端口: $port"
+}
+
 inst_jump(){
-    green "Hysteria 2 端口使用模式配置："
-    echo -e " 1. 单端口模式 (默认)\n 2. 端口跳跃模式 (抗封锁与抗 QoS 推荐)"
-    read -rp "请输入选项 [1-2]: " jumpInput
+    echo ""
+    green "=================================================="
+    green " [步骤 3/5] 配置端口跳跃 (Port Hopping)"
+    green "=================================================="
+    echo -e " 1. 单端口模式 (默认)\n 2. 启用端口跳跃 (推荐，有效规避 UDP 限速与阻断)"
+    read -rp "请选择端口使用模式 [1-2] (回车默认 1): " jumpInput
+    [[ -z "$jumpInput" ]] && jumpInput=1
+
     firstport=""
     endport=""
 
-    if [[ $jumpInput == 2 ]]; then
+    if [[ "$jumpInput" == "2" ]]; then
         while true; do
-            read -p "设置范围端口的起始端口 (建议 10000-65535，默认 20000)：" firstport
-            [[ -z $firstport ]] && firstport=20000
-            read -p "设置范围端口的末尾端口 (建议 10000-65535，默认 40000)：" endport
-            [[ -z $endport ]] && endport=40000
+            read -p "请输入跳跃起始端口 (建议 10000-65535，默认 20000): " firstport
+            [[ -z "$firstport" ]] && firstport=20000
+            read -p "请输入跳跃末尾端口 (建议 10000-65535，默认 40000): " endport
+            [[ -z "$endport" ]] && endport=40000
 
             if [[ ! "$firstport" =~ ^[0-9]+$ ]] || [[ ! "$endport" =~ ^[0-9]+$ ]]; then
-                red "端口必须为数字！"
+                red "端口必须全部为数字！"
             elif [[ $firstport -le 0 || $firstport -gt 65535 || $endport -le 0 || $endport -gt 65535 ]]; then
-                red "端口范围必须在 1-65535 之间！"
+                red "端口数值必须处于 1-65535 之间！"
             elif [[ $firstport -ge $endport ]]; then
                 red "起始端口 ($firstport) 必须小于末尾端口 ($endport)！"
             elif [[ $port -ge $firstport && $port -le $endport ]]; then
-                red "主监听端口 ($port) 不能包含在跳跃端口范围内，请重新调整！"
+                red "主监听端口 ($port) 不能处于跳跃区间内 ($firstport-$endport)，请避开！"
             else
                 break
             fi
@@ -240,49 +263,53 @@ inst_jump(){
         ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" 2>/dev/null || true
         save_firewall
 
-        # 记录跳跃配置
         echo "firstport=$firstport" > /etc/hysteria/jump.conf
         echo "endport=$endport" >> /etc/hysteria/jump.conf
-        green "端口跳跃规则应用成功！"
+        green "端口跳跃规则应用成功！生效范围: $firstport - $endport"
     else
         clean_jump_rules
         rm -f /etc/hysteria/jump.conf
-        yellow "已选择单端口模式"
+        yellow "已选择单端口模式 (未启用端口跳跃)"
     fi
 }
 
-inst_port(){
-    read -p "设置 Hysteria 2 主监听端口 [1-65535]（回车随机分配）：" port
-    [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
-    until [[ -z $(ss -tunlp | grep -w udp | grep -E ":$port$") ]]; do
-        echo -e "${RED} $port 端口占用！${PLAIN}"; read -p "重新设置端口：" port
-    done
-    yellow "使用主监听端口：$port"
-    inst_jump
-}
-
 inst_pwd(){
-    read -p "设置 Hysteria 2 密码（回车随机）：" auth_pwd
-    [[ -z $auth_pwd ]] && auth_pwd=$(date +%s%N | md5sum | cut -c 1-8)
-    yellow "使用密码：$auth_pwd"
+    echo ""
+    green "=================================================="
+    green " [步骤 4/5] 配置连接认证密码"
+    green "=================================================="
+    read -p "设置 Hysteria 2 认证密码 (回车随机生成): " auth_pwd
+    [[ -z "$auth_pwd" ]] && auth_pwd=$(date +%s%N | md5sum | cut -c 1-8)
+    yellow "使用密码: $auth_pwd"
 }
 
 inst_site(){
-    read -rp "伪装网站（去除https://）[回车默认 maimai.sega.jp]：" proxysite
-    [[ -z $proxysite ]] && proxysite="maimai.sega.jp"
+    echo ""
+    green "=================================================="
+    green " [步骤 5/5] 配置 HTTP 流量伪装"
+    green "=================================================="
+    read -rp "请输入伪装网站域名 (去除 https://) [回车默认 maimai.sega.jp]: " proxysite
+    [[ -z "$proxysite" ]] && proxysite="maimai.sega.jp"
+    yellow "伪装目标: $proxysite"
 }
 
 insthysteria(){
     realip
-    if [[ -z "$ipv4" && -z "$ipv6" ]]; then red "严重错误：无法获取公网 IP" && exit 1; fi
+    if [[ -z "$ipv4" && -z "$ipv6" ]]; then red "严重错误：无法获取本机公网 IP" && exit 1; fi
 
     if [[ ! ${SYSTEM} == "CentOS" ]]; then ${PACKAGE_UPDATE}; fi
     ${PACKAGE_INSTALL} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
 
     install_official_core
-    inst_cert && inst_port && inst_pwd && inst_site
 
-    # 黄金法则：无死锁双栈原生监听配置
+    # 分步调用，绝不使用 && 串联，消除静默短路
+    inst_cert
+    inst_port
+    inst_jump
+    inst_pwd
+    inst_site
+
+    # 服务端主配置
     {
         echo "listen: :$port"
         echo ""
@@ -317,7 +344,7 @@ insthysteria(){
 
     mkdir -p /root/hy
 
-    # 生成通用客户端 YAML 配置文件
+    # 通用客户端 YAML
     {
         echo "server: $client_ip:$last_port"
         echo "auth: $auth_pwd"
@@ -341,7 +368,7 @@ insthysteria(){
         fi
     } > /root/hy/hy-client.yaml
 
-    # 生成 Clash Meta / Mihomo 配置
+    # Clash Meta / Mihomo 配置
     {
         echo "mixed-port: 7890"
         echo "allow-lan: false"
@@ -393,7 +420,7 @@ insthysteria(){
         echo "hysteria2://$auth_pwd@[$ipv6]:$port/?insecure=1&sni=$hy_domain#Hysteria2-IPv6-NoHop" > /root/hy/url_v6_nohop.txt
     fi
 
-    # 放行本地防火墙端口
+    # 放行本地防火墙
     iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
     ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
     if [[ -n "$firstport" && -n "$endport" ]]; then
@@ -436,7 +463,7 @@ hysteriaswitch(){
 
 changeconf(){
     green "修改向导："
-    echo -e " 1. 修改主监听端口\n 2. 重新配置端口跳跃\n 3. 修改密码"
+    echo -e " 1. 修改主监听端口\n 2. 独立重新配置端口跳跃\n 3. 修改密码"
     read -p " 请选择 [1-3]：" confAnswer
     if [ "$confAnswer" == "1" ]; then
         oldport=$(cat /etc/hysteria/config.yaml | grep -E "listen:" | awk -F ":" '{print $NF}' | tr -d '"' | tr -d ' ')
@@ -453,7 +480,7 @@ changeconf(){
     elif [ "$confAnswer" == "2" ]; then
         port=$(cat /etc/hysteria/config.yaml | grep -E "listen:" | awk -F ":" '{print $NF}' | tr -d '"' | tr -d ' ')
         inst_jump
-        green "端口跳跃规则已更新！建议执行选项 1 重新生成客户端配置以同步更改。"
+        green "端口跳跃规则已更新！请重新运行选项 5 打印最新配置。"
     elif [ "$confAnswer" == "3" ]; then
         read -p "请输入全新密码: " passwd
         sed -i "s/password:.*/password: \"$passwd\"/g" /etc/hysteria/config.yaml
@@ -486,14 +513,14 @@ showconf(){
     yellow "🛠️ 请根据本地网络环境，按需选择下方节点链接导入："
     echo "--------------------------------------------------------------------------------------"
     if [ -f "/root/hy/url_v4.txt" ] && [ -n "$ipv4" ]; then
-        green "【IPv4 跳跃节点链接】:"
+        green "【IPv4 节点链接】:"
         cat /root/hy/url_v4.txt
         yellow "【IPv4 备用单端口链接】:"
         cat /root/hy/url_v4_nohop.txt
         echo "--------------------------------------------------------------------------------------"
     fi
     if [ -f "/root/hy/url_v6.txt" ] && [ -n "$ipv6" ]; then
-        green "【IPv6 跳跃节点链接】:"
+        green "【IPv6 节点链接】:"
         cat /root/hy/url_v6.txt
         yellow "【IPv6 备用单端口链接】:"
         cat /root/hy/url_v6_nohop.txt
