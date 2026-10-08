@@ -1,3 +1,4 @@
+cat << 'SCRIPT_WRAPPER' > /root/hysteria.sh
 #!/bin/bash
 
 export LANG=en_US.UTF-8
@@ -11,12 +12,21 @@ red(){ echo -e "\033[31m\033[01m$1\033[0m"; }
 green(){ echo -e "\033[32m\033[01m$1\033[0m"; }
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m"; }
 
+[[ $EUID -ne 0 ]] && red "注意: 请在root用户下运行脚本" && exit 1
+
+# 确保自身固化在 /root/hysteria.sh 并创建全局快捷指令 hy2
+SELF_PATH="/root/hysteria.sh"
+if [[ ! -f "$SELF_PATH" ]] || [[ "$0" != "$SELF_PATH" && -f "$0" ]]; then
+    cp -f "$0" "$SELF_PATH" 2>/dev/null || true
+fi
+chmod +x "$SELF_PATH" 2>/dev/null || true
+ln -sf "$SELF_PATH" /usr/local/bin/hy2 2>/dev/null || true
+ln -sf "$SELF_PATH" /usr/bin/hy2 2>/dev/null || true
+
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora")
 PACKAGE_UPDATE=("apt-get update" "apt-get update" "yum -y update" "yum -y update" "yum -y update")
 PACKAGE_INSTALL=("apt -y install" "apt -y install" "yum -y install" "yum -y install" "yum -y install")
-
-[[ $EUID -ne 0 ]] && red "注意: 请在root用户下运行脚本" && exit 1
 
 CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')")
 
@@ -25,7 +35,7 @@ for ((int = 0; int < ${#REGEX[@]}; int++)); do
     [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[int]} ]] && SYSTEM="${RELEASE[int]}" && [[ -n $SYSTEM ]] && break
 done
 
-[[ -z $SYSTEM ]] && red "目前暂不支持你的VPS的操作系统！" && exit 1
+[[ -z $SYSTEM ]] && red "目前暂不支持你的VPS操作系统！" && exit 1
 
 if [[ -z $(type -P curl) ]]; then
     if [[ ! $SYSTEM == "CentOS" ]]; then ${PACKAGE_UPDATE[int]}; fi
@@ -461,6 +471,7 @@ unsthysteria(){
     systemctl disable hysteria-server.service >/dev/null 2>&1
     rm -f /etc/systemd/system/hysteria-server.service
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy
+    rm -f /usr/local/bin/hy2 /usr/bin/hy2 /root/hysteria.sh
     systemctl daemon-reload
     
     if command -v iptables >/dev/null 2>&1; then
@@ -474,7 +485,7 @@ unsthysteria(){
         ip6tables -t nat -X HY2_PREROUTING 2>/dev/null || true
     fi
     save_firewall
-    green "Hysteria 2 已彻底卸载干净！"
+    green "Hysteria 2 及其管理脚本已彻底卸载干净！"
 }
 
 hysteriaswitch(){
@@ -594,3 +605,7 @@ menu() {
 }
 
 menu
+SCRIPT_WRAPPER
+
+chmod +x /root/hysteria.sh
+bash /root/hysteria.sh
